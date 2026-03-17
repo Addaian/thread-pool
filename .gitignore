@@ -1,0 +1,4 @@
+thread_pool
+thread_pool_dbg
+*.o
+*.dSYM/
