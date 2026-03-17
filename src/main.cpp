@@ -11,6 +11,11 @@
 
 // ---------------------------------------------------------------------------
 // WorkStealingDeque isolation demo
+//
+// Verifies the two ends behave correctly before testing them under threads.
+// Push 0..4 onto the front; the internal order becomes [4, 3, 2, 1, 0]
+// (front→back). pop_front takes from the hot/LIFO end; steal_back takes from
+// the cold/FIFO end.
 // ---------------------------------------------------------------------------
 static void demo_work_stealing_deque() {
     std::cout << "=== WorkStealingDeque: LIFO pop and FIFO steal ===\n";
@@ -18,13 +23,12 @@ static void demo_work_stealing_deque() {
     WorkStealingDeque d;
     std::vector<int> out;
 
-    // Push 0..4 onto front. Internal order (front→back): 4 3 2 1 0
     for (int i = 0; i < 5; ++i)
         d.push_front([i, &out] { out.push_back(i); });
 
-    // pop_front: LIFO — expects 4, 3, 2
+    // pop_front (LIFO): takes 4, 3, 2 off the front
     for (int i = 0; i < 3; ++i) { auto t = d.pop_front(); if (t) t(); }
-    // steal_back: FIFO of remaining {1, 0} — expects 0, 1
+    // steal_back (FIFO): remaining deque is [1, 0]; back is 0, then 1
     for (int i = 0; i < 2; ++i) { auto t = d.steal_back(); if (t) t(); }
 
     std::cout << "  output: ";
@@ -33,7 +37,7 @@ static void demo_work_stealing_deque() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 demo: single-threaded TaskQueue
+// Phase 1: single-threaded TaskQueue
 // ---------------------------------------------------------------------------
 static void demo_task_queue() {
     std::cout << "=== Phase 1: TaskQueue demo ===\n";
@@ -47,12 +51,19 @@ static void demo_task_queue() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 demo: fire-and-forget thread pool
+// Phase 2: fire-and-forget thread pool
 // ---------------------------------------------------------------------------
 static void demo_thread_pool() {
     std::cout << "\n=== Phase 2: ThreadPool (fire-and-forget) ===\n";
     {
-        std::mutex cout_mutex;  // must outlive pool (destroyed after pool joins workers)
+        // cout_mutex must be declared before pool so that it is destroyed
+        // AFTER the pool destructor joins all worker threads. C++ destroys
+        // block-scope objects in reverse declaration order; if pool came
+        // first, it would be destroyed (and workers joined) before
+        // cout_mutex, which is safe. But if cout_mutex came first, it would
+        // be destroyed while workers may still be locking it — use-after-
+        // destruction.
+        std::mutex cout_mutex;
         ThreadPool pool(4);
         for (int i = 0; i < 20; ++i) {
             pool.submit([i, &cout_mutex] {
@@ -61,12 +72,16 @@ static void demo_thread_pool() {
                           << " on thread " << std::this_thread::get_id() << "\n";
             });
         }
-    }  // destructor joins all workers
+    }  // pool destructor joins all workers, then cout_mutex is destroyed
     std::cout << "  All tasks complete.\n";
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 demo: futures and exception propagation
+// Phase 3: futures and exception propagation
+//
+// Exceptions thrown inside a task are captured by the packaged_task and
+// re-thrown when the caller calls future.get(). This is standard behaviour
+// for std::future, but worth verifying explicitly.
 // ---------------------------------------------------------------------------
 static void demo_futures() {
     std::cout << "\n=== Phase 3: submit with futures ===\n";
@@ -78,8 +93,7 @@ static void demo_futures() {
     std::cout << "  Result 1: " << f1.get() << " (expected 42)\n";
     std::cout << "  Result 2: " << f2.get() << " (expected 30)\n";
 
-    // Exception propagation
-    auto f3 = pool.submit([] () -> int { throw std::runtime_error("intentional error"); });
+    auto f3 = pool.submit([]() -> int { throw std::runtime_error("intentional error"); });
     try {
         f3.get();
     } catch (const std::runtime_error& e) {
@@ -88,12 +102,12 @@ static void demo_futures() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 demo: shutdown edge cases
+// Phase 4: shutdown edge cases
 // ---------------------------------------------------------------------------
 static void demo_shutdown() {
     std::cout << "\n=== Phase 4: Graceful shutdown edge cases ===\n";
 
-    // Test 1: submit after shutdown throws
+    // submit() after shutdown() must throw immediately.
     {
         ThreadPool pool(2);
         pool.shutdown();
@@ -103,9 +117,12 @@ static void demo_shutdown() {
         } catch (const std::runtime_error& e) {
             std::cout << "  submit-after-shutdown threw as expected: " << e.what() << "\n";
         }
-    }  // destructor on already-stopped pool — should be safe
+    }  // destructor called on an already-stopped pool — must not double-join
 
-    // Test 2: all queued tasks drain before shutdown completes
+    // All queued tasks must complete before the destructor returns.
+    // The atomic counter is the authoritative check: if any task was lost,
+    // dropped, or the destructor returned before all tasks ran, the count
+    // will be less than NUM_TASKS.
     {
         constexpr int NUM_TASKS = 1000;
         std::atomic<int> counter{0};
@@ -113,7 +130,7 @@ static void demo_shutdown() {
             ThreadPool pool(4);
             for (int i = 0; i < NUM_TASKS; ++i)
                 pool.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
-        }  // destructor joins — all tasks should have run
+        }  // destructor blocks here until all 1000 tasks have run
         std::cout << "  Task drain: " << counter.load() << "/" << NUM_TASKS
                   << (counter.load() == NUM_TASKS ? " PASS" : " FAIL") << "\n";
     }
@@ -121,6 +138,12 @@ static void demo_shutdown() {
 
 // ---------------------------------------------------------------------------
 // Phase 5: benchmark
+//
+// Task design: compute sum(sin(seed+i)) for i in [0, 1000). This is ~30µs
+// of pure CPU work per task — long enough to amortize scheduling overhead,
+// short enough to show scaling differences across thread counts. Results are
+// written to a pre-allocated vector by index, so there is no inter-task
+// contention.
 // ---------------------------------------------------------------------------
 static double compute_task(int seed) {
     double sum = 0.0;
@@ -137,7 +160,8 @@ static double measure_serial(int num_tasks) {
     for (int i = 0; i < num_tasks; ++i)
         results[i] = compute_task(i);
     auto t1 = std::chrono::high_resolution_clock::now();
-    // Use results to prevent the compiler from eliding the computation.
+    // Accumulate into a volatile to prevent the compiler from proving that
+    // results is never read and eliminating the entire computation as dead code.
     volatile double sink = std::accumulate(results.begin(), results.end(), 0.0);
     (void)sink;
     return ms_double(t1 - t0).count();
@@ -153,9 +177,13 @@ static double measure_pool(int num_tasks, std::size_t num_threads) {
         ThreadPool pool(num_threads);
         for (int i = 0; i < num_tasks; ++i)
             futures.push_back(pool.submit(compute_task, i));
+        // Collect results sequentially. Since all tasks have uniform compute
+        // cost, futures[0] is unlikely to lag significantly behind futures[N].
+        // For non-uniform workloads, collecting in completion order (e.g. via
+        // a result queue) would be more accurate.
         for (int i = 0; i < num_tasks; ++i)
             results[i] = futures[i].get();
-    }
+    }  // pool destructor joins threads; all futures already resolved so this is instant
     auto t1 = std::chrono::high_resolution_clock::now();
 
     volatile double sink = std::accumulate(results.begin(), results.end(), 0.0);
@@ -163,6 +191,8 @@ static double measure_pool(int num_tasks, std::size_t num_threads) {
     return ms_double(t1 - t0).count();
 }
 
+// Returns the median of v (sorts in place). Using median rather than mean
+// reduces the influence of OS scheduling noise on individual runs.
 static double median(std::vector<double>& v) {
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
@@ -174,7 +204,6 @@ static void run_benchmark() {
     constexpr int NUM_TASKS = 10'000;
     constexpr int RUNS = 5;
 
-    // Serial baseline
     std::vector<double> times(RUNS);
     for (int r = 0; r < RUNS; ++r) times[r] = measure_serial(NUM_TASKS);
     double serial_ms = median(times);
