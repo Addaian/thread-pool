@@ -29,8 +29,8 @@ static void demo_task_queue() {
 static void demo_thread_pool() {
     std::cout << "\n=== Phase 2: ThreadPool (fire-and-forget) ===\n";
     {
+        std::mutex cout_mutex;  // must outlive pool (destroyed after pool joins workers)
         ThreadPool pool(4);
-        std::mutex cout_mutex;
         for (int i = 0; i < 20; ++i) {
             pool.submit([i, &cout_mutex] {
                 std::lock_guard<std::mutex> lk(cout_mutex);

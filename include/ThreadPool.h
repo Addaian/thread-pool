@@ -40,7 +40,7 @@ private:
 // ---------------------------------------------------------------------------
 class ThreadPool {
 public:
-    explicit ThreadPool(std::size_t num_threads = std::thread::hardware_concurrency()) {
+    explicit ThreadPool(std::size_t num_threads = std::max(1u, std::thread::hardware_concurrency())) {
         workers_.reserve(num_threads);
         for (std::size_t i = 0; i < num_threads; ++i)
             workers_.emplace_back(&ThreadPool::worker_loop, this);
@@ -64,16 +64,6 @@ public:
         cv_.notify_all();
         for (auto& w : workers_)
             if (w.joinable()) w.join();
-    }
-
-    // Fire-and-forget submit.
-    void submit(std::function<void()> task) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stop_) throw std::runtime_error("submit on stopped ThreadPool");
-            tasks_.push(std::move(task));
-        }
-        cv_.notify_one();
     }
 
     // submit<F, Args...>() — returns std::future<ReturnType>.
