@@ -10,6 +10,29 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
+// WorkStealingDeque isolation demo
+// ---------------------------------------------------------------------------
+static void demo_work_stealing_deque() {
+    std::cout << "=== WorkStealingDeque: LIFO pop and FIFO steal ===\n";
+
+    WorkStealingDeque d;
+    std::vector<int> out;
+
+    // Push 0..4 onto front. Internal order (front→back): 4 3 2 1 0
+    for (int i = 0; i < 5; ++i)
+        d.push_front([i, &out] { out.push_back(i); });
+
+    // pop_front: LIFO — expects 4, 3, 2
+    for (int i = 0; i < 3; ++i) { auto t = d.pop_front(); if (t) t(); }
+    // steal_back: FIFO of remaining {1, 0} — expects 0, 1
+    for (int i = 0; i < 2; ++i) { auto t = d.steal_back(); if (t) t(); }
+
+    std::cout << "  output: ";
+    for (int v : out) std::cout << v << " ";
+    std::cout << "(expected: 4 3 2 0 1)\n";
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 demo: single-threaded TaskQueue
 // ---------------------------------------------------------------------------
 static void demo_task_queue() {
@@ -184,6 +207,7 @@ int main(int argc, char* argv[]) {
     bool benchmark = argc > 1 && std::strcmp(argv[1], "--benchmark") == 0;
 
     if (!benchmark) {
+        demo_work_stealing_deque();
         demo_task_queue();
         demo_thread_pool();
         demo_futures();

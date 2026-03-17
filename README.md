@@ -1,6 +1,6 @@
 # Thread Pool
 
-A C++ thread pool and task scheduler built from scratch. Supports fire-and-forget tasks and tasks that return values via `std::future`.
+A C++ thread pool built from scratch in five stages, each motivated by a measurable problem with the previous design. The progression from a single-threaded queue to a work-stealing pool demonstrates why production schedulers are designed the way they are.
 
 ## Build
 
@@ -30,51 +30,80 @@ std::cout << future.get();  // 49
 pool.shutdown();
 ```
 
-## Design
+---
 
-### `TaskQueue`
+## How it was built
 
-A thin wrapper around `std::queue<std::function<void()>>` with no internal synchronization. Keeping it non-thread-safe is intentional: `ThreadPool` guards both the queue and the `stop_` flag under a single mutex, which avoids TOCTOU races that would arise if the queue had its own lock.
+### Stage 1 — Single-threaded task queue
 
-### `ThreadPool`
+Starting point: a `TaskQueue` class wrapping `std::queue<std::function<void()>>` with `push()` and `pop()`. No threads, no concurrency — just the core data structure working correctly before adding any complexity.
 
-Each worker thread runs a loop: wait on a condition variable, pop a task, execute it outside the lock. The CV predicate is `stop_ || !tasks_.empty()`, so workers wake on new tasks and on shutdown. On shutdown the worker exits only when `stop_ && tasks_.empty()` — this guarantees all already-queued tasks drain before the pool dies.
+### Stage 2 — Thread pool with a global mutex
 
-### Templated `submit()` and the `shared_ptr<packaged_task>` idiom
+Added a `ThreadPool` class: N worker threads sharing one mutex and one `std::queue`. Each worker loops: lock → check queue → pop task → unlock → execute. A `std::condition_variable` puts idle workers to sleep until work arrives.
 
-`std::function<void()>` requires its stored callable to be copyable. `std::packaged_task` is move-only. The standard fix: wrap the `packaged_task` in a `shared_ptr`, then capture the shared pointer in the lambda stored in the queue. Copies of the lambda share ownership of the task; calling any copy executes it exactly once.
+This works, and the destructor joins all threads gracefully — queued tasks finish before the pool dies. But the design has a fundamental scaling problem.
 
-Arguments are forwarded via `std::apply` over a `std::tuple`, which is cleaner than `std::bind` and handles overloaded functions correctly (C++17).
+### Stage 3 — Futures: submit() returns a result
 
-### Shutdown protocol
+Made `submit()` templated so callers can block on a result:
 
-1. Lock the mutex, set `stop_ = true`, release.
-2. `notify_all()` — wakes all sleeping workers.
-3. `join()` each thread — blocks until all in-flight work finishes.
+```cpp
+auto f = pool.submit([](int x) { return x * x; }, 7);
+int result = f.get();  // blocks until the task completes
+```
 
-`submit()` checks `stop_` under the lock and throws `std::runtime_error` if the pool is stopped.
+`std::packaged_task` is move-only, but `std::function` requires copyability. The fix: wrap the `packaged_task` in a `shared_ptr`. The lambda stored in the queue captures the pointer; calling it executes the task exactly once. Arguments are forwarded with `std::apply` over a `std::tuple` (cleaner than `std::bind`, C++17).
 
-### Thread safety
+### Stage 4 — Graceful shutdown hardening
 
-Verified with `-fsanitize=thread` (ThreadSanitizer). No data races.
+Three edge cases made explicit:
+- `submit()` after `shutdown()` throws `std::runtime_error`
+- Double-shutdown is safe (idempotent via `compare_exchange_strong`)
+- All queued tasks drain before workers exit — verified by submitting 1,000 tasks and asserting the counter equals 1,000 after the destructor returns
 
-## Benchmark
+### Stage 5 — Work stealing
 
-10,000 CPU-bound tasks (each computes `sum(sin(i)) for i in [0, 1000)`), 5 runs per configuration, median reported. Measured on Apple M-series, 10 cores.
+**The problem.** Benchmarking the global-mutex design revealed a sharp regression at high thread counts:
 
-| Threads | Median time (ms) | Speedup vs serial |
-|---------|-----------------|-------------------|
-| serial  | 31.73           | 1.00x             |
-| 1       | 49.36           | 0.64x             |
-| 2       | 24.52           | 1.29x             |
-| 4       | 15.41           | 2.06x             |
-| 8       | 24.48           | 1.30x             |
-| 10      | 19.63           | 1.62x             |
+| Threads | Time (ms) | Speedup |
+|---------|-----------|---------|
+| serial  | 31.73     | 1.00x   |
+| 4       | 15.41     | 2.06x   |
+| 8       | 24.48     | **1.30x — slower than 4** |
+| 10      | 19.63     | 1.62x   |
 
-**What the numbers show:**
+Every worker locks the same mutex on every task pop. With 8 threads, mutex contention dominates actual work — threads spend more time waiting for the lock than running tasks.
 
-- **1 thread is slower than serial** — the overhead of `std::function` type erasure, `shared_ptr` allocation, mutex/CV round-trips, and task queue bookkeeping costs more than the task itself warrants when there's no parallelism to gain.
-- **4 threads is the sweet spot** — 2x speedup with tasks that are short enough for scheduling overhead to matter. Amdahl's Law predicts diminishing returns as thread count grows.
-- **8 and 10 threads regress** — at this task granularity, contention on the single mutex becomes the bottleneck. Each thread frequently wakes, acquires the lock, pops one task, releases, and repeats. With finer-grained tasks, a work-stealing design with per-thread queues would scale better.
+**The fix: work stealing.** Give each worker its own deque. Workers push and pop from the front of their own deque (LIFO — keeps recently-submitted tasks hot in cache). When a worker runs dry, it steals from the *back* of a random victim's deque (FIFO — takes the oldest task, avoids racing with the victim for recently-pushed work).
 
-**Takeaway:** For coarser tasks (longer compute, fewer submissions) this pool scales linearly up to the core count. For very fine-grained work, batch tasks together to amortize scheduling overhead.
+`submit()` distributes tasks round-robin to worker deques via an atomic counter. The only shared mutex (`sleep_mutex_`) is touched only when a worker has genuinely found no work anywhere and needs to sleep. Under load it is never contended.
+
+Each `WorkStealingDeque` is wrapped in `alignas(64) PaddedDeque` to keep adjacent deques on separate cache lines, preventing false sharing.
+
+**Result:**
+
+| Threads | Time (ms) | Speedup |
+|---------|-----------|---------|
+| serial  | 31.73     | 1.00x   |
+| 1       | 33.98     | 0.93x   |
+| 2       | 18.06     | 1.76x   |
+| 4       | 10.21     | 3.11x   |
+| 8       |  8.38     | **3.78x** |
+| 10      |  8.39     | 3.78x   |
+
+8 threads went from slower-than-4 to the fastest configuration. Scaling is near-linear up to the core count.
+
+**10 threads matches 8** — the remaining overhead is `std::function` type erasure and one `shared_ptr` allocation per task. At ~30µs of compute per task, these allocations are the ceiling. A move-only function wrapper would eliminate the `shared_ptr` indirection and push throughput higher.
+
+---
+
+## Design notes
+
+**Why mutex-per-deque and not Chase-Lev lock-free?** Chase-Lev requires careful atomic memory ordering on a circular buffer with power-of-two sizing and hazard-pointer-based resizing. A mutex-per-deque is correct under ThreadSanitizer, dramatically better than one global lock, and shows the key insight (decouple workers) without the implementation complexity of a lock-free structure.
+
+**Why random victim selection?** Round-robin steal attempts are correlated — all idle workers target the same victim simultaneously. Random victims decorrelate steal attempts under contention, which is what Intel TBB and the Go scheduler both use.
+
+**Why `stop_` is atomic but the deques are not.** `stop_` is read on every submission and checked in the CV predicate without holding a lock, so it must be atomic. The deques are already protected by their own mutexes — adding atomics would be redundant and slower.
+
+**Thread safety verified with `-fsanitize=thread` (ThreadSanitizer) at every stage. No data races.**
